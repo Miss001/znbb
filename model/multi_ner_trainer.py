@@ -1,343 +1,398 @@
-# -*- coding: utf-8 -*-
-# ---------------------------
-# 导入依赖
-# ---------------------------
-from transformers import (
-    AutoTokenizer,       # 用于加载预训练分词器
-    AutoModel,           # 用于加载预训练模型
-    AutoConfig,          # 用于加载/修改模型配置
-    PreTrainedModel,     # 所有HF模型的基类
-    Trainer,             # 高级训练接口
-    TrainingArguments,   # 训练参数配置
-)
-from datasets import Dataset  # 用于创建和处理数据集
-from typing import List, Dict, Any, Optional
+import logging
+import os
+import random
 import json
 import math
-import random
-import os
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Union, Tuple
+import numpy as np
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
-from transformers.tokenization_utils_base import BatchEncoding  # 返回类型
+from torch.utils.tensorboard import SummaryWriter
+from transformers import (
+    AutoTokenizer,
+    AutoModel,
+    AutoConfig,
+    PreTrainedModel,
+    Trainer,
+    TrainingArguments,
+    EarlyStoppingCallback,
+    IntervalStrategy,
+)
+from datasets import Dataset
+from transformers.tokenization_utils_base import BatchEncoding
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ---------------------------
-# Multi-label NER 模型定义
-# ---------------------------
+@dataclass
+class NERTrainingConfig:
+    """NER训练配置"""
+    model_path: str = field(default="./chinese-roberta-wwm-ext")
+    output_dir: str = field(default="./ner_multilabel_model")
+    max_length: int = field(default=128)
+    num_train_epochs: int = field(default=5)
+    batch_size: int = field(default=32)
+    learning_rate: float = field(default=3e-5)
+    eval_split: float = field(default=0.1)
+    seed: int = field(default=42)
+    warmup_ratio: float = field(default=0.1)
+    weight_decay: float = field(default=0.01)
+    gradient_accumulation_steps: int = field(default=1)
+    fp16: bool = field(default=True)
+    early_stopping_patience: int = field(default=3)
+    label_smoothing: float = field(default=0.1)
+
 class MultiLabelNERForHF(PreTrainedModel):
-    """
-    支持多标签NER的token分类模型封装
-    输入:
-      - input_ids, attention_mask
-      - labels: shape (batch, seq_len, num_labels) float/binary
-      - categories: shape (batch, seq_len, num_categories) float/binary
-    输出:
-      - dict 包含 loss, label_logits, category_logits
-    """
-    def __init__(self, config: AutoConfig, base_model: nn.Module, num_categories: int):
+    """改进的多标签NER模型"""
+    
+    def __init__(
+        self,
+        config: AutoConfig,
+        base_model: nn.Module,
+        num_categories: int,
+        dropout_prob: float = 0.1
+    ):
         super().__init__(config)
-        self._base_model = base_model  # 预训练基础模型
+        self._base_model = base_model
+        
         # 获取隐藏层维度
-        hidden_size = getattr(config, "hidden_size", None) or getattr(base_model.config, "hidden_size", None)
-        if hidden_size is None:
-            raise ValueError("无法从config或base_model.config中获取hidden_size")
-        # 分类器: 标签预测
-        self.label_classifier = nn.Linear(hidden_size, config.num_labels)
-        # 分类器: 类别预测
-        self.category_classifier = nn.Linear(hidden_size, num_categories)
-        # 多标签二分类损失
-        self.loss_fct = nn.BCEWithLogitsLoss()
-        # HF模型初始化
-        self.post_init()
-
+        self.hidden_size = getattr(config, "hidden_size", None)
+        if self.hidden_size is None:
+            self.hidden_size = getattr(base_model.config, "hidden_size")
+            if self.hidden_size is None:
+                raise ValueError("无法获取hidden_size")
+                
+        # 添加dropout和层标准化
+        self.dropout = nn.Dropout(dropout_prob)
+        self.layer_norm = nn.LayerNorm(self.hidden_size)
+        
+        # 分类器
+        self.classifiers = nn.ModuleDict({
+            "label": nn.Linear(self.hidden_size, config.num_labels),
+            "category": nn.Linear(self.hidden_size, num_categories)
+        })
+        
+        # 损失函数权重
+        self.loss_weights = getattr(config, "loss_weights", {
+            "label": 1.0,
+            "category": 1.0
+        })
+        
+        # 标签平滑
+        self.label_smoothing = getattr(config, "label_smoothing", 0.0)
+        self.loss_fct = nn.BCEWithLogitsLoss(label_smoothing=self.label_smoothing)
+        
+        # 初始化
+        self.init_weights()
+        
     def forward(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
         labels: Optional[torch.FloatTensor] = None,
         categories: Optional[torch.FloatTensor] = None,
+        return_dict: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
-        # 移除Trainer可能传入的不支持参数
-        kwargs.pop("num_items_in_batch", None)
-        # 前向传播基础模型
-        outputs = self._base_model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-        # 获取最后隐藏层
-        hidden = getattr(outputs, "last_hidden_state", None)
-        if hidden is None:
-            hidden = outputs[0]  # fallback
-        # 线性层生成logits
-        label_logits = self.label_classifier(hidden)       # (batch, seq_len, num_labels)
-        category_logits = self.category_classifier(hidden) # (batch, seq_len, num_categories)
+        # 使用自动混合精度
+        with torch.cuda.amp.autocast(enabled=True):
+            # 前向传播基础模型
+            outputs = self._base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                **kwargs
+            )
+            
+            # 获取隐藏状态并应用dropout和归一化
+            hidden = outputs.last_hidden_state
+            hidden = self.dropout(hidden)
+            hidden = self.layer_norm(hidden)
+            
+            # 计算logits
+            logits = {
+                name: classifier(hidden)
+                for name, classifier in self.classifiers.items()
+            }
+            
+            loss = None
+            if labels is not None and categories is not None:
+                # 计算损失
+                device = hidden.device
+                dtype = hidden.dtype
+                
+                labels = labels.to(device=device, dtype=dtype)
+                categories = categories.to(device=device, dtype=dtype)
+                
+                losses = {}
+                for name, target in [("label", labels), ("category", categories)]:
+                    losses[name] = self.loss_fct(
+                        logits[name].view(-1, logits[name].size(-1)),
+                        target.view(-1, target.size(-1))
+                    )
+                
+                # 应用权重
+                loss = sum(
+                    self.loss_weights[name] * loss_val
+                    for name, loss_val in losses.items()
+                )
+                
+            return {
+                "loss": loss,
+                "label_logits": logits["label"],
+                "category_logits": logits["category"],
+                "hidden_states": hidden
+            }
 
-        loss = None
-        if labels is not None and categories is not None:
-            # 将标签转到同一device和dtype
-            device = label_logits.device
-            labels = labels.to(device=device, dtype=torch.float)
-            categories = categories.to(device=device, dtype=torch.float)
-            # reshape为 (batch*seq_len, num_labels) 计算BCE
-            loss_label = self.loss_fct(label_logits.view(-1, label_logits.size(-1)),
-                                       labels.view(-1, labels.size(-1)))
-            loss_category = self.loss_fct(category_logits.view(-1, category_logits.size(-1)),
-                                         categories.view(-1, categories.size(-1)))
-            loss = loss_label + loss_category
-
-        return {"loss": loss, "label_logits": label_logits, "category_logits": category_logits}
-
-
-# ---------------------------
-# 数据批处理器: pad & convert labels
-# ---------------------------
 @dataclass
-class DataCollatorForMultiLabelTokenClassification:
-    """
-    用于对多标签NER数据进行padding，并将labels/categories转换为torch.FloatTensor
-    """
+class OptimizedDataCollator:
+    """优化的数据整理器"""
+    
     tokenizer: AutoTokenizer
     padding: bool = True
     max_length: Optional[int] = None
     pad_to_multiple_of: Optional[int] = None
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # 提取labels和categories
-        labels = [f.pop("labels") for f in features]         # shape: [seq_len, num_labels]
-        categories = [f.pop("categories") for f in features] # shape: [seq_len, num_categories]
-
-        # 使用tokenizer.pad对input_ids, attention_mask等进行padding
-        batch = self.tokenizer.pad(
-            features,
-            padding="max_length",
-            max_length=self.max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors="pt"
+    
+    def __post_init__(self):
+        self.pad_token_id = (
+            self.tokenizer.pad_token_id or
+            self.tokenizer.eos_token_id
         )
+    
+    def __call__(
+        self,
+        features: List[Dict[str, Any]]
+    ) -> Dict[str, torch.Tensor]:
+        try:
+            batch_size = len(features)
+            if not batch_size:
+                raise ValueError("Empty batch")
+                
+            # 提取标签
+            labels = [f.pop("labels") for f in features]
+            categories = [f.pop("categories") for f in features]
+            
+            # 验证
+            if not all(isinstance(l, list) for l in labels):
+                raise ValueError("Invalid labels format")
+            if not all(isinstance(c, list) for c in categories):
+                raise ValueError("Invalid categories format")
+                
+            # Padding
+            batch = self.tokenizer.pad(
+                features,
+                padding=self.padding,
+                max_length=self.max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_tensors="pt"
+            )
+            
+            # 准备标签tensor
+            seq_len = batch["input_ids"].shape[1]
+            num_labels = len(labels[0][0])
+            num_categories = len(categories[0][0])
+            
+            padded_labels = torch.zeros(
+                (batch_size, seq_len, num_labels),
+                dtype=torch.float32
+            )
+            padded_cats = torch.zeros(
+                (batch_size, seq_len, num_categories),
+                dtype=torch.float32
+            )
+            
+            # 填充标签
+            for i, (lbl, cat) in enumerate(zip(labels, categories)):
+                cur_len = min(len(lbl), seq_len)
+                if cur_len > 0:
+                    padded_labels[i, :cur_len] = torch.tensor(
+                        lbl[:cur_len],
+                        dtype=torch.float32
+                    )
+                    padded_cats[i, :cur_len] = torch.tensor(
+                        cat[:cur_len],
+                        dtype=torch.float32
+                    )
+            
+            batch["labels"] = padded_labels
+            batch["categories"] = padded_cats
+            
+            return batch
+            
+        except Exception as e:
+            logger.error(f"数据整理错误: {str(e)}")
+            raise
 
-        # 获取batch大小和序列长度
-        batch_size = batch["input_ids"].shape[0]
-        seq_len = batch["input_ids"].shape[1]
-
-        # 获取label/cat数量
-        num_labels = len(labels[0][0]) if len(labels) > 0 and len(labels[0]) > 0 else 0
-        num_categories = len(categories[0][0]) if len(categories) > 0 and len(categories[0]) > 0 else 0
-
-        # 初始化全零tensor
-        padded_labels = torch.zeros((batch_size, seq_len, num_labels), dtype=torch.float)
-        padded_cats = torch.zeros((batch_size, seq_len, num_categories), dtype=torch.float)
-
-        # 将原始标签复制到padded tensor中
-        for i in range(batch_size):
-            lbl = labels[i]
-            cat = categories[i]
-            cur_len = min(len(lbl), seq_len)
-            if cur_len > 0:
-                padded_labels[i, :cur_len, :] = torch.tensor(lbl[:cur_len], dtype=torch.float)
-            if len(cat) > 0:
-                padded_cats[i, :cur_len, :] = torch.tensor(cat[:cur_len], dtype=torch.float)
-
-        batch["labels"] = padded_labels
-        batch["categories"] = padded_cats
-        return batch
-
-
-# ---------------------------
-# NER训练器封装
-# ---------------------------
 class NERTrainer:
-    def __init__(self, model_path: str = "./chinese-roberta-wwm-ext", output_dir: str = "./ner_multilabel_model", max_length: int = 128):
-        self.model_path = model_path
-        self.output_dir = output_dir
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-        # 标签/类别映射
-        self.label2id: Dict[str, int] = {}
-        self.id2label: Dict[int, str] = {}
-        self.category2id: Dict[str, int] = {}
-        self.id2category: Dict[int, str] = {}
-        self.max_length = max_length
-
-    def convert_to_multilabel_bio_with_category(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        将输入的文本和标签转换为多标签BIO矩阵，同时附加类别信息
-        输入: [{"text": str, "labels": [[start, end, label, category], ...]}]
-        输出: [{"tokens": list(str), "ner_label_tags": [[0/1]], "ner_category_tags": [[0/1]]}]
-        """
-        # 收集所有标签/类别
-        all_labels = set()
-        all_categories = set()
-        for ex in data:
-            for start, end, label, category in ex.get("labels", []):
-                all_labels.add(label)
-                all_categories.add(category if category is not None else "UNK")
-
-        # 构建映射
-        self.label2id = {label: i for i, label in enumerate(sorted(all_labels))}
-        self.id2label = {i: label for label, i in self.label2id.items()}
-        self.category2id = {cat: i for i, cat in enumerate(sorted(all_categories))}
-        self.id2category = {i: cat for cat, i in self.category2id.items()}
-
-        result = []
-        for ex in data:
-            text = ex["text"]
-            tokens = list(text)  # 中文按字符级分词
-            L = len(tokens)
-            num_labels = len(self.label2id)
-            num_cats = len(self.category2id)
-            # 初始化标签矩阵
-            label_matrix = [[0] * num_labels for _ in range(L)]
-            category_matrix = [[0] * num_cats for _ in range(L)]
-            # 填充矩阵
-            for start, end, label, category in ex.get("labels", []):
-                if start >= L or end > L or start < 0 or end <= start:
-                    continue
-                label_id = self.label2id.get(label)
-                cat = category if category is not None else "UNK"
-                cat_id = self.category2id.get(cat)
-                if label_id is None or cat_id is None:
-                    continue
-                for i in range(start, end):
-                    label_matrix[i][label_id] = 1
-                    category_matrix[i][cat_id] = 1
-            result.append({
-                "tokens": tokens,
-                "ner_label_tags": label_matrix,
-                "ner_category_tags": category_matrix
-            })
-        return result
-
-    def tokenize_and_align_labels(self, examples: Dict[str, List[Any]]) -> BatchEncoding:
-        """
-        将字符级tokens转换为模型输入ID，并对齐labels和categories
-        """
-        tokenized_inputs = self.tokenizer(
-            examples["tokens"],
-            is_split_into_words=True,
-            truncation=True,
-            padding=False,
-            max_length=self.max_length,
-            return_attention_mask=True
+    """优化的NER训练器"""
+    
+    def __init__(self, config: NERTrainingConfig):
+        self.config = config
+        self.writer = SummaryWriter(
+            os.path.join(config.output_dir, "tensorboard")
         )
-        batch_label_ids = []
-        batch_category_ids = []
-
-        # 对齐子词级别标签
-        for i in range(len(examples["tokens"])):
-            word_ids = tokenized_inputs.word_ids(batch_index=i)
-            label_matrix = examples["ner_label_tags"][i]
-            category_matrix = examples["ner_category_tags"][i]
-
-            seq_label_ids = []
-            seq_cat_ids = []
-            for word_idx in word_ids:
-                if word_idx is None:
-                    seq_label_ids.append([0] * len(self.label2id))
-                    seq_cat_ids.append([0] * len(self.category2id))
-                else:
-                    seq_label_ids.append(label_matrix[word_idx])
-                    seq_cat_ids.append(category_matrix[word_idx])
-            batch_label_ids.append(seq_label_ids)
-            batch_category_ids.append(seq_cat_ids)
-
-        tokenized_inputs["labels"] = batch_label_ids
-        tokenized_inputs["categories"] = batch_category_ids
-        return tokenized_inputs
-
+        
+        # 初始化
+        self._initialize_resources()
+        
+    def _initialize_resources(self):
+        """初始化资源"""
+        try:
+            # 验证路径
+            if not os.path.exists(self.config.model_path):
+                raise ValueError(f"模型路径不存在: {self.config.model_path}")
+                
+            # 加载tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model_path,
+                use_fast=True,
+                add_prefix_space=True
+            )
+            
+            # 初始化映射
+            self.label2id: Dict[str, int] = {}
+            self.id2label: Dict[int, str] = {}
+            self.category2id: Dict[str, int] = {}
+            self.id2category: Dict[int, str] = {}
+            
+        except Exception as e:
+            raise RuntimeError(f"资源初始化失败: {str(e)}")
+    
+    def compute_metrics(self, eval_pred):
+        """计算评估指标"""
+        predictions, labels = eval_pred
+        # 分别处理label和category的预测
+        label_preds = predictions[0]
+        category_preds = predictions[1]
+        
+        # 将logits转换为预测标签
+        label_preds = (torch.sigmoid(torch.tensor(label_preds)) > 0.5).numpy()
+        category_preds = (torch.sigmoid(torch.tensor(category_preds)) > 0.5).numpy()
+        
+        # 计算指标
+        metrics = {}
+        for name, preds, target in [
+            ("label", label_preds, labels[0]),
+            ("category", category_preds, labels[1])
+        ]:
+            precision, recall, f1, _ = precision_recall_fscore_support(
+                target.flatten(),
+                preds.flatten(),
+                average='binary'
+            )
+            accuracy = accuracy_score(target.flatten(), preds.flatten())
+            
+            metrics.update({
+                f"{name}_precision": precision,
+                f"{name}_recall": recall,
+                f"{name}_f1": f1,
+                f"{name}_accuracy": accuracy
+            })
+            
+        return metrics
+    
     def train(
         self,
-        train_data: List[Dict[str, Any]],
-        num_train_epochs: int = 5,
-        batch_size: int = 8,
-        learning_rate: float = 5e-5,
-        eval_split: float = 0.1,
-        seed: int = 42,
+        train_data: List[Dict[str, Any]]
     ):
-        """
-        多标签NER训练入口
-        """
-        # 设置随机种子
-        random.seed(seed)
-        torch.manual_seed(seed)
-
-        # 数据预处理
-        processed = self.convert_to_multilabel_bio_with_category(train_data)
-        random.shuffle(processed)
-        split_idx = math.ceil(len(processed) * (1 - eval_split))
-        train_subset = processed[:split_idx]
-        eval_subset = processed[split_idx:] if split_idx < len(processed) else []
-
-        train_dataset = Dataset.from_list(train_subset)
-        eval_dataset = Dataset.from_list(eval_subset) if eval_subset else None
-
-        # tokenization
-        train_tokenized = train_dataset.map(
-            lambda ex: self.tokenize_and_align_labels(ex),
-            batched=True,
-            remove_columns=["tokens", "ner_label_tags", "ner_category_tags"]
-        )
-        eval_tokenized = None
-        if eval_dataset:
-            eval_tokenized = eval_dataset.map(
-                lambda ex: self.tokenize_and_align_labels(ex),
-                batched=True,
-                remove_columns=["tokens", "ner_label_tags", "ner_category_tags"]
+        """训练入口"""
+        try:
+            # 设置随机种子
+            self._set_seed()
+            
+            # 数据预处理
+            train_dataset, eval_dataset = self._prepare_datasets(train_data)
+            
+            # 初始化模型
+            model = self._initialize_model()
+            
+            # 训练参数
+            training_args = self._get_training_args()
+            
+            # 配置Trainer
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                data_collator=OptimizedDataCollator(
+                    tokenizer=self.tokenizer,
+                    max_length=self.config.max_length
+                ),
+                compute_metrics=self.compute_metrics,
+                callbacks=[
+                    EarlyStoppingCallback(
+                        early_stopping_patience=self.config.early_stopping_patience
+                    )
+                ]
             )
-
-        # 加载预训练基础模型
-        _base_model = AutoModel.from_pretrained(self.model_path).to("cpu")
-        config = AutoConfig.from_pretrained(self.model_path)
-        config.num_labels = len(self.label2id)
-        config.id2label = self.id2label
-        config.label2id = self.label2id
-
-        # 初始化多标签NER模型
-        model = MultiLabelNERForHF(config=config, base_model=_base_model, num_categories=len(self.category2id)).to("cpu")
-
-        # 数据collator
-        data_collator = DataCollatorForMultiLabelTokenClassification(
-            tokenizer=self.tokenizer,
-            padding=True,
-            max_length=self.max_length
-        )
-
-        # 训练参数
-        training_args = TrainingArguments(
-            output_dir=self.output_dir,
-            learning_rate=learning_rate,
-            per_device_train_batch_size=batch_size,
-            num_train_epochs=num_train_epochs,
-            save_strategy="epoch",
+            
+            # 训练
+            trainer.train()
+            
+            # 保存
+            self._save_model(model)
+            
+            # 清理
+            self.writer.close()
+            
+        except Exception as e:
+            logger.error(f"训练失败: {str(e)}")
+            raise
+            
+    def _set_seed(self):
+        """设置随机种子"""
+        random.seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        torch.manual_seed(self.config.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.config.seed)
+            
+    def _prepare_datasets(
+        self,
+        data: List[Dict[str, Any]]
+    ) -> Tuple[Dataset, Optional[Dataset]]:
+        """准备数据集"""
+        processed = self.convert_to_multilabel_bio_with_category(data)
+        
+        # 划分数据集
+        random.shuffle(processed)
+        split_idx = math.ceil(len(processed) * (1 - self.config.eval_split))
+        
+        train_data = processed[:split_idx]
+        eval_data = processed[split_idx:] if split_idx < len(processed) else None
+        
+        # 转换为Dataset对象
+        train_dataset = Dataset.from_list(train_data)
+        eval_dataset = Dataset.from_list(eval_data) if eval_data else None
+        
+        # Tokenization
+        train_dataset = self._tokenize_dataset(train_dataset)
+        if eval_dataset:
+            eval_dataset = self._tokenize_dataset(eval_dataset)
+            
+        return train_dataset, eval_dataset
+        
+    def _get_training_args(self) -> TrainingArguments:
+        """获取训练参数"""
+        return TrainingArguments(
+            output_dir=self.config.output_dir,
+            learning_rate=self.config.learning_rate,
+            per_device_train_batch_size=self.config.batch_size,
+            num_train_epochs=self.config.num_train_epochs,
+            save_strategy=IntervalStrategy.EPOCH,
+            evaluation_strategy=IntervalStrategy.EPOCH,
             logging_steps=50,
-            fp16=False, #torch.cuda.is_available(),
+            fp16=self.config.fp16 and torch.cuda.is_available(),
+            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+            warmup_ratio=self.config.warmup_ratio,
+            weight_decay=self.config.weight_decay,
             save_total_limit=3,
-            logging_dir=os.path.join(self.output_dir, "logs"),
-            seed=seed,
-            use_cpu=True  # 强制使用CPU,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            seed=self.config.seed
         )
-
-        # Trainer封装训练
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_tokenized,
-            eval_dataset=eval_tokenized,
-            data_collator=data_collator,
-            tokenizer=self.tokenizer,
-        )
-
-        trainer.train()
-
-        # 保存模型和映射
-        os.makedirs(self.output_dir, exist_ok=True)
-        model.save_pretrained(self.output_dir)
-        self.tokenizer.save_pretrained(self.output_dir)
-        mapping_path = os.path.join(self.output_dir, "label_map.json")
-        with open(mapping_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "id2label": self.id2label,
-                "label2id": self.label2id,
-                "id2category": self.id2category,
-                "category2id": self.category2id
-            }, f, ensure_ascii=False, indent=2)
-
-        print(f"训练完成，模型已保存到: {self.output_dir}")
-        print(f"标签映射已保存到: {mapping_path}")
