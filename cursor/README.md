@@ -23,8 +23,10 @@ Copy-Item -Path '.\*' -Destination 'D:\Cursor\' -Recurse -Force
 ## 使用方法
 
 1. **完全退出 Cursor**（托盘 → 退出，任务管理器确认无残留进程）
-2. 双击 `D:\Cursor\migrate-cursor.bat`
+2. 双击 `D:\Cursor\migrate-cursor.bat`（会自动请求管理员权限）
 3. 迁移完成后重新启动 Cursor
+
+> **注意**：`.bat` 文件必须使用纯 ASCII 编码（不可含中文或 UTF-8 BOM），否则 cmd 会报 `'ho' 不是内部或外部命令` 等乱码错误。中文提示已移至 `.ps1` 脚本中。
 
 ## 迁移范围
 

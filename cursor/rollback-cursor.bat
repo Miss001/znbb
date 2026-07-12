@@ -1,13 +1,17 @@
 @echo off
-chcp 65001 >nul
+cd /d "%~dp0"
+net session >nul 2>&1
+if %errorLevel% neq 0 (
+    powershell -NoProfile -Command "Start-Process cmd -ArgumentList '/c \"\"%~f0\"\"' -Verb RunAs"
+    exit /b
+)
 echo ========================================
-echo   Cursor 用户数据迁移 - 回滚
+echo   Cursor User Data Migration Rollback
 echo ========================================
 echo.
-echo 请确保已完全退出 Cursor，然后按任意键继续...
+echo Please quit Cursor completely before continuing.
+echo Press any key to start...
 pause >nul
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"%~dp0rollback-cursor.ps1\"' -Verb RunAs -Wait"
-
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0rollback-cursor.ps1"
 echo.
 pause

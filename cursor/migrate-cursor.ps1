@@ -18,6 +18,8 @@
 #>
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 
 $TargetRoot = 'D:\Cursor\UserData'
 $LogFile    = Join-Path $TargetRoot 'migration.log'
